@@ -1,0 +1,78 @@
+version: '3.8'
+
+services:
+  api-gateway:
+    image: ${REGISTRY_URL}/api-gateway:${TAG:-latest}
+    container_name: api-gateway
+    ports:
+      - "8000:8000"
+    environment:
+      - NODE_ENV=production
+      - USER_SERVICE_URL=http://user-service:3000
+      - ORDER_SERVICE_URL=http://order-service:3000
+    depends_on:
+      - user-service
+      - order-service
+    networks:
+      - microservices-net
+    restart: always
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  user-service:
+    image: ${REGISTRY_URL}/user-service:${TAG:-latest}
+    container_name: user-service
+    environment:
+      - DATABASE_URL=postgresql://${DB_USER}:${DB_PASS}@postgres:5432/users
+    depends_on:
+      - postgres
+    networks:
+      - microservices-net
+    restart: always
+
+  order-service:
+    image: ${REGISTRY_URL}/order-service:${TAG:-latest}
+    container_name: order-service
+    environment:
+      - DATABASE_URL=postgresql://${DB_USER}:${DB_PASS}@postgres:5432/orders
+    depends_on:
+      - postgres
+    networks:
+      - microservices-net
+    restart: always
+
+  postgres:
+    image: postgres:15-alpine
+    container_name: postgres
+    volumes:
+      - pg_/var/lib/postgresql/data
+    environment:
+      - POSTGRES_USER=${DB_USER}
+      - POSTGRES_PASSWORD=${DB_PASS}
+      - POSTGRES_DB=main
+    networks:
+      - microservices-net
+    restart: always
+
+  nginx:
+    image: nginx:alpine
+    container_name: nginx
+    ports:
+      - "80:80"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - api-gateway
+    networks:
+      - microservices-net
+    restart: always
+
+networks:
+  microservices-net:
+    driver: bridge
+
+volumes:
+  pg_data:
