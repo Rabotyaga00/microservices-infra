@@ -1,0 +1,42 @@
+server:
+  port: 8080
+
+spring:
+  cloud:
+    gateway:
+      httpclient:
+        ssl:
+          useInsecureTrustManager: true
+      routes:
+        - id: auth-v1
+          uri: ${AUTH_SERVICE_URL:http://auth-service:8080}
+          predicates:
+            - Path=/api/v1/**
+        - id: product
+          uri: ${PRODUCT_SERVICE_URL:http://product-service:8080}
+          predicates:
+            - Path=/product/**
+        - id: category
+          uri: http://product-service:8080
+          predicates:
+            - Path=/category/**
+        - id: seller
+          uri: ${SELLER_SERVICE_URL:http://seller-service:8080}
+          predicates:
+            - Path=/seller/**
+        - id: order
+          uri: ${ORDER_SERVICE_URL:http://order-service:8080}
+          predicates:
+            - Path=/order/**
+        - id: payment
+          uri: ${PAYMENT_SERVICE_URL:http://payment-service:8080}
+          predicates:
+            - Path=/payment/**
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info
+  endpoint:
+    health:
+      show-details: never

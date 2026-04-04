@@ -1,78 +1,443 @@
 version: '3.8'
 
 services:
+  # ========================
+  # API Gateway (нет БД)
+  # ========================
   api-gateway:
     image: ${REGISTRY_URL}/api-gateway:${TAG:-latest}
+    volumes:
+      - ./config/application.yaml:/app/config/application.yaml:ro
+    command: ["--spring.config.location=/app/config/application.yaml"]
     container_name: api-gateway
     ports:
-      - "8000:8000"
+      - "8000:8080"
     environment:
-      - NODE_ENV=production
-      - USER_SERVICE_URL=http://user-service:3000
-      - ORDER_SERVICE_URL=http://order-service:3000
+      - NODE_ENV=${NODE_ENV:-production}
+      - PRODUCT_SERVICE_URL=http://product-service:8080
+      - ORDER_SERVICE_URL=http://order-service:8080
+      - AUTH_SERVICE_URL=http://auth-service:8080
+      - SELLER_SERVICE_URL=http://seller-service:8080
     depends_on:
-      - user-service
+      - product-service
       - order-service
+      - auth-service
+      - seller-service
     networks:
-      - microservices-net
+      - dco-network
     restart: always
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/actuator/health"]
       interval: 30s
       timeout: 10s
       retries: 3
 
-  user-service:
-    image: ${REGISTRY_URL}/user-service:${TAG:-latest}
-    container_name: user-service
+  # ========================
+  # Product Service + Product DB
+  # ========================
+  product-postgres:
+    image: postgres:17-alpine
+    container_name: product-postgres
     environment:
-      - DATABASE_URL=postgresql://${DB_USER}:${DB_PASS}@postgres:5432/users
-    depends_on:
-      - postgres
+      POSTGRES_USER: ${PRODUCT_DB_USER}
+      POSTGRES_PASSWORD: ${PRODUCT_DB_PASSWORD}
+      POSTGRES_DB: ${PRODUCT_DB_NAME}
+    volumes:
+      - product-postgres_:/var/lib/postgresql/data
+      - ../ProductService/docker/init-db.sql:/docker-entrypoint-initdb.d/init-db.sql
     networks:
-      - microservices-net
+      - dco-network
     restart: always
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${PRODUCT_DB_USER} -d ${PRODUCT_DB_NAME}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  product-service:
+    image: ${REGISTRY_URL}/product-service:${TAG:-latest}
+    container_name: product-service
+    environment:
+      - SPRING_DATASOURCE_URL=jdbc:postgresql://product-postgres:5432/${PRODUCT_DB_NAME}
+      - SPRING_DATASOURCE_USERNAME=${PRODUCT_DB_USER}
+      - SPRING_DATASOURCE_PASSWORD=${PRODUCT_DB_PASSWORD}
+      - SPRING_KAFKA_BOOTSTRAP_SERVERS=kafka-0:9091,kafka-1:9091,kafka-2:9091
+      - NODE_ENV=${NODE_ENV:-production}
+    depends_on:
+      product-postgres:
+        condition: service_healthy
+      kafka-0:
+        condition: service_started
+      kafka-1:
+        condition: service_started
+      kafka-2:
+        condition: service_started
+    networks:
+      - dco-network
+    restart: always
+
+  product-redis:
+    image: redis:7-alpine
+    container_name: product-redis
+    networks:
+      - dco-network
+    restart: always
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ========================
+  # Order Service + Order DB
+  # ========================
+  order-postgres:
+    image: postgres:17-alpine
+    container_name: order-postgres
+    environment:
+      POSTGRES_USER: ${ORDER_DB_USER}
+      POSTGRES_PASSWORD: ${ORDER_DB_PASSWORD}
+      POSTGRES_DB: ${ORDER_DB_NAME}
+    volumes:
+      - order-postgres_:/var/lib/postgresql/data
+    networks:
+      - dco-network
+    restart: always
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${ORDER_DB_USER} -d ${ORDER_DB_NAME}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
   order-service:
     image: ${REGISTRY_URL}/order-service:${TAG:-latest}
     container_name: order-service
     environment:
-      - DATABASE_URL=postgresql://${DB_USER}:${DB_PASS}@postgres:5432/orders
+      - SPRING_DATASOURCE_URL=jdbc:postgresql://order-postgres:5432/${ORDER_DB_NAME}
+      - SPRING_DATASOURCE_USERNAME=${ORDER_DB_USER}
+      - SPRING_DATASOURCE_PASSWORD=${ORDER_DB_PASSWORD}
+      - SPRING_DATASOURCE_DRIVER_CLASS_NAME=org.postgresql.Driver
+      - SPRING_LIQUIBASE_ENABLED=true
+      - SPRING_LIQUIBASE_CHANGE_LOG=classpath:db/changelog/db.changelog-master.xml
+      - SPRING_KAFKA_BOOTSTRAP_SERVERS=kafka-0:9091,kafka-1:9091,kafka-2:9091
+
     depends_on:
-      - postgres
+      product-postgres:
+        condition: service_healthy
+      kafka-0:
+        condition: service_started
+      kafka-1:
+        condition: service_started
+      kafka-2:
+        condition: service_started
+
     networks:
-      - microservices-net
+      - dco-network
     restart: always
 
-  postgres:
-    image: postgres:15-alpine
-    container_name: postgres
-    volumes:
-      - pg_/var/lib/postgresql/data
+  # ========================
+  # Auth Service (Go) + Auth DB
+  # ========================
+  auth-postgres:
+    image: postgres:17-alpine
+    container_name: auth-postgres
     environment:
-      - POSTGRES_USER=${DB_USER}
-      - POSTGRES_PASSWORD=${DB_PASS}
-      - POSTGRES_DB=main
+      POSTGRES_USER: ${AUTH_DB_USER}
+      POSTGRES_PASSWORD: ${AUTH_DB_PASSWORD}
+      POSTGRES_DB: ${AUTH_DB_NAME}
+    volumes:
+      - auth-postgres_:/var/lib/postgresql/data
     networks:
-      - microservices-net
+      - dco-network
     restart: always
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${AUTH_DB_USER} -d ${AUTH_DB_NAME}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
+  auth-goose-migrate:
+    image: ghcr.io/kukymbr/goose-docker:3.24.3
+    container_name: auth-goose-migrate
+    environment:
+      - GOOSE_DRIVER=postgres
+      - GOOSE_DBSTRING=host=auth-postgres port=5432 user=${AUTH_DB_USER} password=${AUTH_DB_PASSWORD} dbname=${AUTH_DB_NAME} sslmode=disable
+    volumes:
+      - ../../GolandProjects/authService/migrations:/migrations:ro
+    command: [ "up" ]
+    depends_on:
+      auth-postgres:
+        condition: service_healthy
+    networks:
+      - dco-network
+    restart: "no"
+
+
+  auth-service:
+    image: ${REGISTRY_URL}/auth-service:${TAG:-latest}
+    container_name: auth-service
+    ports:
+      - "8081:8080"
+    environment:
+      - DATABASE_URL=postgresql://${AUTH_DB_USER}:${AUTH_DB_PASSWORD}@auth-postgres:5432/${AUTH_DB_NAME}
+      - JWT_SECRET=${JWT_SECRET}
+      - CONFIG_PATH=/app/config.yaml
+    command: ["sh", "-c", "echo '=== CONFIG FILE ===' && cat /app/config.yaml && echo '=== START APP ===' && exec ./auth-service"]
+    volumes:
+      - ./config/auth.yaml:/app/config.yaml:ro
+    depends_on:
+      auth-postgres:
+        condition: service_healthy
+      auth-redis:
+        condition: service_healthy
+      auth-goose-migrate:
+        condition: service_completed_successfully
+    networks:
+      dco-network:
+        aliases:
+          - go-service
+    restart: always
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8080/api/v1/health"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+
+  auth-redis:
+    image: redis:7-alpine
+    container_name: auth-redis
+    volumes:
+      - auth-redis_:/data
+    command: redis-server --appendonly yes
+    networks:
+      - dco-network
+    restart: always
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+
+  # ========================
+  # Seller Service (Kotlin) + Seller DB
+  # ========================
+  seller-postgres:
+    image: postgres:17-alpine
+    container_name: seller-postgres
+    environment:
+      POSTGRES_USER: ${SELLER_DB_USER}
+      POSTGRES_PASSWORD: ${SELLER_DB_PASSWORD}
+      POSTGRES_DB: ${SELLER_DB_NAME}
+    volumes:
+      - seller-postgres_:/var/lib/postgresql/data
+    networks:
+      - dco-network
+    restart: always
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${SELLER_DB_USER} -d ${SELLER_DB_NAME}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  seller-service:
+    image: ${REGISTRY_URL}/seller-service:${TAG:-latest}
+    container_name: seller-service
+    ports:
+      - "8082:8080"
+    environment:
+      - SPRING_DATASOURCE_URL=jdbc:postgresql://seller-postgres:5432/${SELLER_DB_NAME}
+      - SPRING_DATASOURCE_USERNAME=${SELLER_DB_USER}
+      - SPRING_DATASOURCE_PASSWORD=${SELLER_DB_PASSWORD}
+      - SERVER_PORT=8080
+      - SPRING_PROFILES_ACTIVE=prod
+    depends_on:
+      seller-postgres:
+        condition: service_healthy
+    networks:
+      - dco-network
+    restart: always
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8080/actuator/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+
+
+  payment-postgres:
+    image: postgres:17-alpine
+    container_name: payment-postgres
+    environment:
+      POSTGRES_USER: ${PAYMENT_DB_USER}
+      POSTGRES_PASSWORD: ${PAYMENT_DB_PASSWORD}
+      POSTGRES_DB: ${PAYMENT_DB_NAME}
+    volumes:
+      - payment-postgres_:/var/lib/postgresql/data
+    networks:
+      - dco-network
+    restart: always
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${PAYMENT_DB_USER} -d ${PAYMENT_DB_NAME}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  payment-service:
+    image: ${REGISTRY_URL}/payment-service:${TAG:-latest}
+    container_name: payment-service
+    environment:
+      - SPRING_DATASOURCE_URL=jdbc:postgresql://payment-postgres:5432/${PAYMENT_DB_NAME}
+      - SPRING_DATASOURCE_USERNAME=${PAYMENT_DB_USER}
+      - SPRING_DATASOURCE_PASSWORD=${PAYMENT_DB_PASSWORD}
+      - SPRING_DATASOURCE_DRIVER_CLASS_NAME=org.postgresql.Driver
+      - SPRING_LIQUIBASE_ENABLED=true
+      - SPRING_LIQUIBASE_CHANGE_LOG=classpath:db/changelog/db.changelog-master.xml
+      - SPRING_KAFKA_BOOTSTRAP_SERVERS=kafka-0:9091,kafka-1:9091,kafka-2:9091
+
+    depends_on:
+      payment-postgres:
+        condition: service_healthy
+      kafka-0:
+        condition: service_started
+      kafka-1:
+        condition: service_started
+      kafka-2:
+        condition: service_started
+
+    networks:
+      - dco-network
+    restart: always
+  # ========================
+  # Nginx (reverse proxy)
+  # ========================
   nginx:
     image: nginx:alpine
     container_name: nginx
     ports:
       - "80:80"
+      - "443:443"
     volumes:
       - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./ssl:/etc/nginx/ssl:ro
     depends_on:
       - api-gateway
     networks:
-      - microservices-net
+      - dco-network
     restart: always
 
+  kafka-0:
+      # Будем использовать данный образ
+      image: confluentinc/cp-kafka:8.1.0
+      # Имя контейнера
+      container_name: kafka-0
+      # hostname контейнера
+      hostname: kafka-0
+      # Пробрасываем порты, чтоб слать в Kafka сообщения с хоста
+      ports:
+        - "29092:29092"
+      environment:
+        # Уникальный ID кластера в формате UUID
+        # Можно сгенерировать через команду
+        # docker run confluentinc/cp-kafka:8.1.0 kafka-storage random-uuid
+        CLUSTER_ID: ZETVJENWRjaECDUEExP_eg
+        # Уникальный ID ноды внутри кластера
+        KAFKA_NODE_ID: 0
+        # Нода и контроллер, и брокер
+        KAFKA_PROCESS_ROLES: broker,controller
+        # "Слушатели" используются для указания способа подключения к Kafka ноде,
+        # То есть Kafka откроет порты и будет слушать на них подключения
+        # В нашем случае первое слово - Alias, ://: - на всех сетевых интерфейсах,
+        # Ну и в конце, очевидно, порт
+        KAFKA_LISTENERS: INTERNAL://:9091,EXTERNAL://:29092,CONTROLLER://:9093
+        # Перечисляем список нод, которые являются контроллерами в формате
+        # [NodeID]@[Hostname]:[Port]
+        KAFKA_CONTROLLER_QUORUM_VOTERS: 0@kafka-0:9093,1@kafka-1:9093,2@kafka-2:9093
+        # Здесь мы указываем, куда Kafka будет "перенаправлять" клиента после того,
+        # Как тот подключится к ней. Контроллер не указываем, так как это нужно
+        # Только для внутренней работы Kafka
+        KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka-0:9091,EXTERNAL://localhost:29092
+        # Настраиваем шифрование
+        # В нашем случае PLAINTEXT означает его отсутствие
+        KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT
+        # Указываем, что для контроллера используется "Слушатель" CONTROLLER
+        KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+        # Указываем, что для брокеров используется "Слушатель" INTERNAL
+        KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+
+      networks:
+        - dco-network
+
+  kafka-1:
+      image: confluentinc/cp-kafka:8.1.0
+      container_name: kafka-1
+      hostname: kafka-1
+      ports:
+        - "29093:29092"
+      environment:
+        CLUSTER_ID: ZETVJENWRjaECDUEExP_eg
+        KAFKA_NODE_ID: 1
+        KAFKA_PROCESS_ROLES: broker,controller
+        KAFKA_LISTENERS: INTERNAL://:9091,EXTERNAL://:29092,CONTROLLER://:9093
+        KAFKA_CONTROLLER_QUORUM_VOTERS: 0@kafka-0:9093,1@kafka-1:9093,2@kafka-2:9093
+        KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka-1:9091,EXTERNAL://localhost:29093
+        KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT
+        KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+        KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      networks:
+        - dco-network
+  kafka-2:
+      image: confluentinc/cp-kafka:8.1.0
+      container_name: kafka-2
+      hostname: kafka-2
+      ports:
+        - "29094:29092"
+      environment:
+        CLUSTER_ID: ZETVJENWRjaECDUEExP_eg
+        KAFKA_NODE_ID: 2
+        KAFKA_PROCESS_ROLES: broker,controller
+        KAFKA_LISTENERS: INTERNAL://:9091,EXTERNAL://:29092,CONTROLLER://:9093
+        KAFKA_CONTROLLER_QUORUM_VOTERS: 0@kafka-0:9093,1@kafka-1:9093,2@kafka-2:9093
+        KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka-2:9091,EXTERNAL://localhost:29094
+        KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT
+        KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+        KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      networks:
+        - dco-network
+
+
+  kafka-ui:
+      image: provectuslabs/kafka-ui:v0.7.2
+      container_name: kafka-ui
+      hostname: kafka-ui
+      depends_on:
+        - kafka-0
+        - kafka-1
+        - kafka-2
+      ports:
+        - "8086:8080"
+      environment:
+        # Название кластера в веб-интерфейсе
+        KAFKA_CLUSTERS_0_NAME: local
+        # Указываем адреса наших брокеров в кластере
+        # так как Kafka-UI и брокеры в одной Docker-сети, то используем порты 9091
+        KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka-0:9091,kafka-1:9091,kafka-2:9091
+        # Настройка для динамической конфигурации брокеров через UI
+        DYNAMIC_CONFIG_ENABLED: true
+      networks:
+        - dco-network
+# ========================
+# Networks & Volumes
+# ========================
 networks:
-  microservices-net:
+  dco-network:
     driver: bridge
 
 volumes:
-  pg_data:
+  product-postgres_:
+  order-postgres_:
+  auth-postgres_:
+  seller-postgres_:
+  auth-redis_:
+  payment-postgres_:
